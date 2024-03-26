@@ -9,13 +9,16 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
+using static FASTERCache.DistributedCache;
 
 namespace FASTERCache;
 
 /// <summary>
 /// Implements IDistributedCache
 /// </summary>
-internal sealed partial class DistributedCache : CacheBase<DistributedCache.Input, DistributedCache.Output, Empty, DistributedCache.CacheFunctions>,  IDistributedCache, IDisposable, IExperimentalBufferCache
+internal sealed partial class DistributedCache :
+    CacheBase<DistributedCache.Input, DistributedCache.Output, Empty, DistributedCache.CacheFunctions>,
+    IDistributedCache, IDisposable, IExperimentalBufferCache
 {
     protected override byte KeyPrefix => (byte)'D';
 
@@ -23,7 +26,8 @@ internal sealed partial class DistributedCache : CacheBase<DistributedCache.Inpu
 
     public DistributedCache(CacheService cacheService, IServiceProvider services)
         : this(cacheService, GetClock(services))
-    { }
+    {
+    }
 
     static object? GetClock(IServiceProvider services)
     {
@@ -44,7 +48,8 @@ internal sealed partial class DistributedCache : CacheBase<DistributedCache.Inpu
         ISystemClock systemClock => CacheFunctions.Create(systemClock),
         _ => CacheFunctions.Create()
     })
-    { }
+    {
+    }
 
 
     private bool Slide(in Output output, ref Input input)
@@ -58,12 +63,14 @@ internal sealed partial class DistributedCache : CacheBase<DistributedCache.Inpu
                 return true;
             }
         }
+
         return false;
     }
 
     const int MAX_STACKALLOC_SIZE = 128;
 
-    ReadOnlySpan<byte> WriteValue(Span<byte> target, byte[] value, out byte[] lease, DistributedCacheEntryOptions? options)
+    ReadOnlySpan<byte> WriteValue(Span<byte> target, byte[] value, out byte[] lease,
+        DistributedCacheEntryOptions? options)
     {
         var absoluteExpiration = GetExpiryTicks(options, out var slidingExpiration);
         lease = EnsureSize(ref target, value.Length + 12);
@@ -84,49 +91,69 @@ internal sealed partial class DistributedCache : CacheBase<DistributedCache.Inpu
         return new(lease, 0, length);
     }
 
-    private async Task<TResult?> GetAsync<TResult>(string key, IBufferWriter<byte>? bufferWriter, bool readArray, CancellationToken token, Func<Output, TResult> selector)
+    private unsafe Task<TResult?> GetAsync<TResult>(string key, IBufferWriter<byte>? bufferWriter, bool readArray,
+        CancellationToken token, Func<Output, TResult?> selector)
     {
-        var keyMemory = WriteKey(key, out var lease);
+        Span<byte> buffer = stackalloc byte[MAX_STACKALLOC_SIZE];
+        WriteKey(ref buffer, key, out var lease);
 
         var session = GetSession();
         try
         {
-            TResult? finalResult = default;
-            using (keyMemory.Pin())
+            fixed (byte* __ = buffer)
             {
-                var fixedKey = SpanByte.FromPinnedMemory(keyMemory);
+                var fixedKey = SpanByte.FromFixedSpan(buffer);
 
-                var input = new Input(readArray ? Input.OperationFlags.ReadArray : Input.OperationFlags.None, bufferWriter);
+                var input = new Input(readArray ? Input.OperationFlags.ReadArray : Input.OperationFlags.None,
+                    bufferWriter);
 
-                var readResult = await session.ReadAsync(fixedKey, input, token: token);
-                var status = readResult.Status;
-                var output = readResult.Output;
-                if (status.IsPending)
+                var readResultTask = session.ReadAsync(fixedKey, input, token: token);
+                if (readResultTask.IsCompletedSuccessfully)
                 {
-                    (status, output) = readResult.Complete();
-                }
-
-                if (status.IsCompletedSuccessfully && status.Found)
-                {
-                    finalResult = selector(output);
-                    Debug.WriteLine($"Read: {status}");
-
-                    if (Slide(output, ref input))
+                    var result = readResultTask.Result;
+                    var status = result.Status;
+                    var output = result.Output;
+                    if (status.IsPending)
                     {
-                        var upsertResult = await session.BasicContext.UpsertAsync(fixedKey, input, default, token: token);
-                        status = upsertResult.Status;
-                        if (status.IsPending)
-                        {
-                            status = upsertResult.Complete();
-                        }
-                        Debug.WriteLine($"Upsert (slide): {status}");
+                        (status, output) = result.Complete();
                     }
+
+                    if (status is { IsCompletedSuccessfully: true, Found: true })
+                    {
+                        var finalResult = selector(output);
+                        Debug.WriteLine($"Read: {status}");
+
+                        if (Slide(output, ref input))
+                        {
+                            var upsertResultTask =
+                                session.BasicContext.UpsertAsync(fixedKey, input, default, token: token);
+                            if (upsertResultTask.IsCompletedSuccessfully)
+                            {
+                                var upsertResult = upsertResultTask.Result;
+                                if (status.IsPending)
+                                {
+                                    status = upsertResult.Complete();
+                                }
+                            }
+                            else
+                            {
+                                return AwaitUpsertResultTask(upsertResultTask, lease, session, finalResult);
+                            }
+
+                            Debug.WriteLine($"Upsert (slide): {status}");
+                        }
+
+                        lease?.Dispose();
+                        ReuseSession(session);
+                        return Task.FromResult(finalResult);
+                    }
+
+                    return Task.FromResult<TResult?>(default);
+
                 }
-                // await session.CompletePendingAsync(true, token: token);
+
+                return AwaitReadResultTask(readResultTask, lease, session, selector, input, fixedKey, token);
             }
-            ReturnLease(lease);
-            ReuseSession(session);
-            return finalResult;
         }
         catch
         {
@@ -135,7 +162,59 @@ internal sealed partial class DistributedCache : CacheBase<DistributedCache.Inpu
         }
     }
 
-    const int MAX_STACKALLOC = 128;
+    private async Task<TResult?> AwaitReadResultTask<TResult>(
+        ValueTask<FasterKV<SpanByte, SpanByte>.ReadAsyncResult<Input, Output, Empty>> readResultTask,
+        IMemoryOwner<byte>? lease, ClientSession<SpanByte, SpanByte, Input, Output, Empty, CacheFunctions> session,
+        Func<Output, TResult?> selector, Input input, SpanByte fixedKey, CancellationToken token)
+    {
+        var result = await readResultTask;
+        var status = result.Status;
+        var output = result.Output;
+        if (status.IsPending)
+        {
+            (status, output) = result.Complete();
+        }
+
+        var finalResult = selector(output);
+        Debug.WriteLine($"Read: {status}");
+
+        if (Slide(output, ref input))
+        {
+            var upsertResultTask =
+                session.BasicContext.UpsertAsync(fixedKey, input, default, token: token);
+            if (upsertResultTask.IsCompletedSuccessfully)
+            {
+                var upsertResult = upsertResultTask.Result;
+                if (status.IsPending)
+                {
+                    status = upsertResult.Complete();
+                }
+            }
+            else
+            {
+                return await AwaitUpsertResultTask(upsertResultTask, lease, session, finalResult);
+            }
+
+            Debug.WriteLine($"Upsert (slide): {status}");
+        }
+
+        lease?.Dispose();
+        ReuseSession(session);
+        return finalResult;
+    }
+
+    private async Task<TResult?> AwaitUpsertResultTask<TResult>(ValueTask<FasterKV<SpanByte, SpanByte>.UpsertAsyncResult<Input, Output, Empty>> upsertResultTask, IMemoryOwner<byte>? lease, ClientSession<SpanByte, SpanByte, Input, Output, Empty, CacheFunctions> session, TResult? finaResult)
+    {
+        var result = await upsertResultTask;
+        if (result.Status.IsPending)
+        {
+            result.Complete();
+        }
+        lease?.Dispose();
+        ReuseSession(session);
+        return finaResult;
+    }
+
     private unsafe byte[]? Get(string key, bool getPayload)
     {
         var keySpan = WriteKey(key.Length <= MAX_STACKALLOC ? stackalloc byte[MAX_STACKALLOC] : default, key, out var lease);

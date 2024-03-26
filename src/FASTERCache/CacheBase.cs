@@ -15,6 +15,7 @@ namespace FASTERCache;
 internal abstract class CacheBase : IDisposable
 {
     private int _isDisposed;
+    protected const int MAX_STACKALLOC = 128;
     internal bool IsDisposed => Volatile.Read(ref _isDisposed) != 0;
     protected abstract byte KeyPrefix { get; }
     void IDisposable.Dispose()
@@ -67,6 +68,17 @@ internal abstract class CacheBase : IDisposable
         var actualLength = Encoding.GetBytes(key, 0, key.Length, lease, 1);
         Debug.Assert(length == actualLength + 1);
         return new(lease, 0, length);
+    }
+
+    protected void WriteKey(ref Span<byte> buffer, string key, out IMemoryOwner<byte>? lease)
+    {
+        var length = Encoding.GetByteCount(key) + 1;
+        lease = null;
+        var target = length < buffer.Length ? buffer : (lease = MemoryPool<byte>.Shared.Rent(length)).Memory.Span;
+        target[0] = KeyPrefix;
+        var actualLength = Encoding.GetBytes(key, target.Slice(1));
+        Debug.Assert(length == actualLength + 1);
+        buffer = target.Slice(0, length);
     }
 
 }
